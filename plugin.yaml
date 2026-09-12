@@ -1,0 +1,8 @@
+name: follow-up
+version: 0.1.0
+description: >-
+  Codex-style click-to-run follow-up prompts for Hermes Desktop. The model ends a
+  reply with a ::followup{...} paragraph; the plugin renders it as a compact
+  command list whose rows insert (or send) the prompt.
+author: anhtahaylove
+license: MIT
