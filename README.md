@@ -33,6 +33,11 @@ hermes plugins install https://github.com/huuhungn/hermes-plugin-follow-up
 hermes plugins enable follow-up
 ```
 
+Then open **Desktop → Plugins**, locate Follow-up, and enable its **Desktop**
+half. A fresh CLI installation can leave the Desktop half disabled: the agent
+allow-list and Desktop's persisted enable decision are separate. Check the
+Desktop switch rather than assuming the CLI commands enabled the renderer.
+
 The repository includes `plugin.yaml` and `desktop/plugin.js`. No npm packages
 are needed at runtime; Hermes supplies React and `@hermes/plugin-sdk`. The npm
 dependencies below are development-only.
@@ -104,10 +109,11 @@ is required. Tests exercise the real plugin component, SDK calls, async locks,
 fail-closed routing, Unicode, accessibility and status behavior. They do not
 prove model-policy compliance or live Hermes Desktop delivery.
 
-Optional upstream parser/CSS integration checks require an explicit Hermes
-source/build checkout; see test skip messages for required environment
-variables. Without that checkout, they must skip rather than validate a copied
-parser. Before publication, run Hermes' own admission validator:
+Optional upstream parser integration requires `HERMES_SOURCE` pointing to an
+explicit Hermes source checkout. Without it, that test skips rather than
+validating a copied parser. The CSS test is a self-contained static source
+guard, not an upstream stylesheet or visual integration test. Before
+publication, run Hermes' own admission validator:
 
 ```sh
 hermes plugins validate . --json
