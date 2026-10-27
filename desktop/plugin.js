@@ -11,40 +11,29 @@
  *
  *   ::followup{p1="Run the tests" p2="Open a PR" p3="Explain the tradeoff"}
  *
- * Rules the host enforces (see lib/transcript-directives.ts): the directive
- * must be the WHOLE paragraph, attrs are untrusted key="value" strings, the
- * brace body caps at 1024 chars, and an unclaimed directive degrades to plain
- * prose — so turning this plugin off breaks nothing.
+ * Attributes are untrusted strings; directive parsing is the host's concern.
+ * Turning this plugin off leaves unclaimed directives as ordinary text.
  *
  * Click a row     → inserts the prompt into that chat's composer (you edit, then send).
- * Ctrl/Cmd+click  → sends it immediately.
+ * Ctrl/Cmd+click  → dispatches to that chat's composer (not delivery confirmation).
  * "Insert all"    → appends every prompt as separate lines.
  *
- * Routing is surface-exact: the panel finds the chat surface it is rendered
- * inside (`[data-composer-target]`, which wraps transcript AND composer), so
- * with split tiles the prompt lands in the chat you clicked in, never another.
+ * Routing uses the public SDK and the render sessionId, never app DOM or
+ * private event protocols. Submit acknowledges dispatch, not delivery.
  */
 
-import { cn, Codicon, haptic, Tip, usePluginI18n } from '@hermes/plugin-sdk'
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { Codicon, haptic, host, Tip, usePluginI18n } from '@hermes/plugin-sdk'
+import { useCallback, useLayoutEffect, useId, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 const ID = 'follow-up'
-
-/** Hermes' internal composer bus (app/chat/composer/focus.ts). Not re-exported
- *  by the plugin SDK, so we speak its CustomEvent protocol directly. */
-const INSERT_EVENT = 'hermes:composer-insert'
-const SUBMIT_EVENT = 'hermes:composer-submit'
-
-/** Inactive keep-alive tabs stay mounted under this attribute. */
-const HIDDEN_PANE = '[data-pane-hidden]'
-
-/** Core's rich editor node (app/chat/composer/rich-editor.ts). Carries the
- *  composer's disabled state, which decides whether the bus is even listening. */
-const RICH_INPUT_SLOT = 'composer-rich-input'
+// Plugins are not scanned by Tailwind; native focus indicators stay intact.
+const buttonStyle = { font: 'inherit', color: 'inherit', background: 'transparent', border: 0, borderRadius: 4, textAlign: 'start', cursor: 'pointer' }
 
 const MAX_ITEMS = 5
 const MAX_PROMPT_LEN = 400
+// Reject disguise controls, but preserve ZWJ/ZWNJ for emoji and Indic scripts.
+const UNSAFE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u
 
 /** How long a status line stays before clearing itself. Long enough to read,
  *  short enough that scrolling back to an old reply never shows a stale
@@ -82,19 +71,8 @@ function cutSafely(text, max) {
     return text.slice(0, end)
   }
 
-  // Compatibility fallback for older runtimes: preserve the two boundaries
-  // that most often corrupt user text (surrogate pairs and combining marks).
-  let end = max
-
-  if (end > 0 && /[\uD800-\uDBFF]/.test(text[end - 1])) {
-    end -= 1
-  }
-
-  while (end > 0 && /\p{M}/u.test(text[end])) {
-    end -= 1
-  }
-
-  return text.slice(0, end)
+  // Old engines cannot guarantee a grapheme boundary; show only the badge.
+  return ''
 }
 
 /** Prompts out of untrusted directive attrs: p1..p5, trimmed, capped, deduped.
@@ -109,14 +87,14 @@ function promptsFromAttrs(attrs) {
   for (let i = 1; i <= MAX_ITEMS; i += 1) {
     const raw = attrs?.[`p${i}`]
 
-    if (typeof raw !== 'string') {
+    if (typeof raw !== 'string' || UNSAFE.test(raw)) {
       continue
     }
 
-    const full = raw.trim()
+    const full = raw.normalize('NFC').replace(/\s+/gu, ' ').trim()
     const prompt = cutSafely(full, MAX_PROMPT_LEN)
 
-    if (!prompt) {
+    if (!full) {
       continue
     }
 
@@ -139,98 +117,19 @@ function promptsFromAttrs(attrs) {
   return items
 }
 
-/** The chat surface this panel lives in — the element carrying both the
- *  composer routing key and the mounted-surface identity. Returns null when
- *  the surface is buried in an inactive tab (submit must fail closed). */
-function surfaceFor(node) {
-  const surface = node?.closest?.('[data-composer-target]')
-
-  if (!surface || surface.closest(HIDDEN_PANE)) {
-    return null
-  }
-
-  const target = surface.dataset.composerTarget
-  const surfaceId = surface.dataset.composerSurfaceId
-
-  return target ? { el: surface, surfaceId: surfaceId || null, target } : null
-}
-
-/**
- * True when that surface's composer is accepting input.
- *
- * This is NOT cosmetic. While the composer is disabled (gateway closed) core
- * tears down its insert subscription entirely (`use-composer-draft.ts` returns
- * early on `inputDisabled`) and gates submit on `!inputDisabled`
- * (`use-composer-submit.ts`). The event would be dispatched into the void, so
- * without this check the panel reports "Sent." for a prompt that never left.
- * Core marks the state on the editor node itself.
- */
-function composerAccepting(surface) {
-  const editor = surface?.querySelector?.(`[data-slot="${RICH_INPUT_SLOT}"]`)
-
-  // No editor found: don't invent a failure — let the dispatch proceed.
-  if (!editor) {
-    return true
-  }
-
-  // Read the ATTRIBUTES React actually renders (`aria-disabled={... : undefined}`
-  // and `contentEditable={!inputDisabled}`) rather than the `isContentEditable`
-  // property — the property is a Chromium-only convenience that jsdom doesn't
-  // implement, so testing it would be untestable and silently wrong off-browser.
-  return (
-    editor.getAttribute('aria-disabled') !== 'true' &&
-    editor.getAttribute('contenteditable') !== 'false'
-  )
-}
-
-function insertPrompt(node, text) {
-  const surface = surfaceFor(node)
-
-  if (!surface || !composerAccepting(surface.el)) {
-    return false
-  }
-
-  // Deferred to a macrotask, exactly like core's `requestComposerInsert`: the
-  // synchronous click handler must finish first, or it steals focus back from
-  // the composer effect. Submit, by contrast, dispatches NOW (see below).
-  window.setTimeout(() => {
-    window.dispatchEvent(
-      new CustomEvent(INSERT_EVENT, { detail: { mode: 'block', target: surface.target, text } })
-    )
-  }, 0)
-
-  return true
-}
-
-function submitPrompt(node, text) {
-  const surface = surfaceFor(node)
-
-  // Fail closed exactly like core: no visible surface identity, no broadcast.
-  if (!surface?.surfaceId || !composerAccepting(surface.el)) {
-    return false
-  }
-
-  // Synchronous on purpose. Core's `dispatchNow` comment: deferring a submit
-  // lets a tab reveal switch the visible pane before subscribers run, so the
-  // task gets dropped or claimed by the wrong composer.
-  window.dispatchEvent(
-    new CustomEvent(SUBMIT_EVENT, {
-      detail: { surfaceId: surface.surfaceId, target: surface.target, text }
-    })
-  )
-
-  return true
-}
-
-function FollowUpPanel({ attrs, streaming }) {
+function FollowUpPanel({ attrs, sessionId, streaming }) {
   const t = usePluginI18n(ID)
-  const rootRef = useRef(null)
   const titleId = useId()
   const actionDescriptionId = useId()
   const [status, setStatus] = useState('')
   const statusTimer = useRef(0)
+  const alive = useRef(true)
+  const locked = useRef(false)
+  const [pending, setPending] = useState(false)
 
   const items = promptsFromAttrs(attrs)
+  const supported = (sessionId === null || (typeof sessionId === 'string' && sessionId.trim())) &&
+    typeof host.composer?.insertText === 'function' && typeof host.composer?.submit === 'function'
 
   // Announce through a keyed live region. Re-running the SAME action must
   // re-announce, but an identical string in an unchanged region is silent to
@@ -243,16 +142,30 @@ function FollowUpPanel({ attrs, streaming }) {
   }, [])
 
   const run = useCallback(
-    (text, send) => {
-      const node = rootRef.current
-      const ok = send ? submitPrompt(node, text) : insertPrompt(node, text)
-
-      if (ok) {
-        haptic('tap')
+    async (text, send) => {
+      if (!alive.current || locked.current || !supported || streaming) return
+      locked.current = true
+      setPending(true)
+      // TranscriptDirectiveProps: null means this transcript has no session.
+      // SDK composer.ts: null targets ACTIVE; 'new' targets only the fresh draft.
+      const address = sessionId === null ? 'new' : sessionId
+      try {
+        const ok = send
+          ? await host.composer.submit(address, text)
+          : await host.composer.insertText(address, text, { mode: 'block' })
+        if (!alive.current) return
+        if (ok === true) haptic('tap')
+        announce(ok === true ? (send ? t('sent') : t('inserted')) : t('noComposer'))
+      } catch {
+        if (alive.current) announce(t('noComposer'))
+      } finally {
+        if (alive.current) {
+          locked.current = false
+          setPending(false)
+        }
       }
-      announce(ok ? (send ? t('sent') : t('inserted')) : t('noComposer'))
     },
-    [announce, t]
+    [announce, sessionId, streaming, supported, t]
   )
 
   // Alt+1..5 runs the Nth prompt; add Ctrl/Cmd to send it outright. Bound on
@@ -261,7 +174,9 @@ function FollowUpPanel({ attrs, streaming }) {
   // be inside this panel, which Tab reaches natively.
   const onKeyDown = useCallback(
     event => {
-      if (!event.altKey || event.isComposing || event.getModifierState?.('AltGraph')) {
+      if (!event.altKey || event.shiftKey || event.repeat || event.isComposing || event.nativeEvent?.isComposing ||
+          event.getModifierState?.('AltGraph') || /^(INPUT|TEXTAREA|SELECT)$/.test(event.target?.tagName) ||
+          event.target?.isContentEditable || !supported || pending || streaming) {
         return
       }
 
@@ -277,11 +192,17 @@ function FollowUpPanel({ attrs, streaming }) {
       const item = items[index]
       run(item.fullText, item.truncated ? false : event.ctrlKey || event.metaKey)
     },
-    [items, run]
+    [items, pending, run, streaming, supported]
   )
 
   // Clear a pending timer if the panel unmounts mid-countdown.
-  useEffect(() => () => window.clearTimeout(statusTimer.current), [])
+  useLayoutEffect(() => {
+    alive.current = true
+    return () => {
+      alive.current = false
+      window.clearTimeout(statusTimer.current)
+    }
+  }, [])
 
   // A directive mid-stream is still being typed — render nothing rather than
   // flashing a half-parsed panel.
@@ -298,10 +219,7 @@ function FollowUpPanel({ attrs, streaming }) {
       label: t('emptyDirectiveTip'),
       side: 'top',
       children: jsxs('span', {
-        className: cn(
-          'inline-flex select-none items-center gap-1.5 rounded-md border border-dashed',
-          'border-border/60 px-2 py-0.5 text-xs text-muted-foreground'
-        ),
+        style: { display: 'inline-flex', alignItems: 'center', gap: 6, border: '1px dashed var(--ui-stroke-secondary, #8884)', borderRadius: 6, padding: '2px 8px', fontSize: 12, color: 'var(--ui-text-tertiary, #888)' },
         'data-testid': 'directive-drop-badge',
         role: 'note',
         'aria-label': `${t('emptyDirective')}. ${t('emptyDirectiveTip')}`,
@@ -315,25 +233,20 @@ function FollowUpPanel({ attrs, streaming }) {
   }
 
   return jsxs('section', {
-    ref: rootRef,
     onKeyDown,
     role: 'group',
     'aria-labelledby': titleId,
     'data-testid': 'follow-up-panel',
-    className: cn(
-      'my-2 flex w-full flex-col gap-1.5 rounded-md border p-2',
-      'border-(--ui-stroke-secondary) transition-colors duration-150 ease-out',
-      'hover:border-(--ui-stroke-primary)',
-      'motion-reduce:transition-none'
-    ),
+    'aria-busy': pending,
+    style: { marginBlock: 8, display: 'flex', flexDirection: 'column', gap: 6, border: '1px solid var(--ui-stroke-secondary, #8884)', borderRadius: 6, padding: 8 },
     children: [
       jsxs('div', {
-        className: 'flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-(--ui-text-tertiary)',
+        style: { display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--ui-text-tertiary, #888)' },
         children: [
           jsx(Codicon, { name: 'debug-step-over' }),
-          jsx('span', { id: titleId, className: 'font-medium text-(--ui-text-secondary)', children: t('title') }),
+          jsx('span', { id: titleId, style: { fontWeight: 500, color: 'var(--ui-text-secondary, inherit)' }, children: t('title') }),
           jsx('span', {
-            className: 'text-[0.6875rem] tabular-nums text-(--ui-text-quaternary)',
+            style: { fontSize: 11, fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary, #888)' },
             'aria-hidden': true,
             children: items.length
           }),
@@ -342,12 +255,8 @@ function FollowUpPanel({ attrs, streaming }) {
               label: t('insertAllTip'),
               children: jsxs('button', {
                 type: 'button',
-                className: cn(
-                  'ml-auto inline-flex min-h-8 items-center gap-1 rounded px-2 py-1 transition-colors',
-                  'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground',
-                  'focus-visible:outline-none focus-visible:ring-2 ring-(--ui-accent)',
-                  'motion-reduce:transition-none'
-                ),
+                style: { ...buttonStyle, marginInlineStart: 'auto', minHeight: 32, padding: '4px 8px', display: 'inline-flex', alignItems: 'center', gap: 4 },
+                disabled: !supported || pending,
                 onClick: () => run(items.map(item => item.fullText).join('\n'), false),
                 children: [jsx(Codicon, { name: 'insert', size: '0.85em' }), t('insertAll')]
               })
@@ -355,14 +264,14 @@ function FollowUpPanel({ attrs, streaming }) {
         ]
       }),
 
+      !supported && jsx('p', { role: 'note', children: t('upgradeRequired') }),
       jsx('span', {
         id: actionDescriptionId,
-        className: 'sr-only',
+        style: { position: 'absolute', width: 1, height: 1, padding: 0, margin: -1, overflow: 'hidden', clip: 'rect(0, 0, 0, 0)', whiteSpace: 'nowrap', border: 0 },
         children: t('actionDescription')
       }),
       jsx('div', {
-        role: 'list',
-        className: 'flex flex-col gap-0.5',
+        style: { display: 'flex', flexDirection: 'column', gap: 2 },
         children: items.map((item, index) =>
           jsx(
             Tip,
@@ -370,65 +279,39 @@ function FollowUpPanel({ attrs, streaming }) {
               label: item.truncated ? t('rowTipTruncated') : t('rowTip'),
               children: jsxs('button', {
                 type: 'button',
-                role: 'listitem',
                 'aria-describedby': actionDescriptionId,
                 // Alt+N is invisible to a screen reader unless the control
                 // says so; the number badge alone is decoration.
-                'aria-keyshortcuts': index < 9 ? `Alt+${index + 1}` : undefined,
-                className: cn(
-                  'group flex w-full min-h-10 items-start gap-2 rounded px-2 py-2 text-left text-sm',
-                  'leading-snug transition-colors duration-150 ease-out',
-                  'hover:bg-(--chrome-action-hover)',
-                  'focus-visible:outline-none focus-visible:ring-2 ring-(--ui-accent)',
-                  'motion-reduce:transition-none'
-                ),
+                'aria-keyshortcuts': `Alt+${index + 1} Control+Alt+${index + 1} Meta+Alt+${index + 1}`,
+                style: { ...buttonStyle, width: '100%', minHeight: 40, display: 'flex', alignItems: 'start', gap: 8, padding: 8, fontSize: 14, lineHeight: 1.4 },
+                disabled: !supported || pending,
                 onClick: event => run(item.fullText, item.truncated ? false : event.ctrlKey || event.metaKey),
                 children: [
                   jsx('span', {
-                    className: cn(
-                      'mt-px inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-sm',
-                      'text-[0.625rem] font-semibold tabular-nums',
-                      // The index is wayfinding, not content: quiet until the
-                      // row is the one under the cursor.
-                      'text-(--ui-text-quaternary) transition-colors duration-150',
-                      'group-hover:text-foreground',
-                      'motion-reduce:transition-none'
-                    ),
+                    style: { display: 'inline-flex', width: 16, height: 16, flexShrink: 0, alignItems: 'center', justifyContent: 'center', fontSize: 10, fontVariantNumeric: 'tabular-nums', color: 'var(--ui-text-quaternary, #888)' },
                     children: String(index + 1)
                   }),
                   jsxs('span', {
-                    className: 'min-w-0 flex-1 break-words',
+                    style: { minWidth: 0, flex: 1, overflowWrap: 'anywhere' },
                     children: [
-                      item.displayText,
+                      jsx('span', { 'data-testid': 'prompt-preview', children: item.displayText }),
                       item.truncated &&
                         jsx('span', {
-                          className: cn(
-                            'ml-1.5 rounded px-1 align-middle text-[0.625rem]',
-                            'bg-(--chrome-action-hover) text-(--ui-text-quaternary)'
-                          ),
+                          style: { marginInlineStart: 6, paddingInline: 4, fontSize: 10, color: 'var(--ui-text-quaternary, #888)' },
                           // The ellipsis is decorative; the label carries it.
                           title: t('truncatedTip'),
                           children: t('truncated')
                         })
                     ]
                   }),
-                  // Affordance revealed on hover: says what a click will do
-                  // without adding permanent clutter to every row.
+                  // Keep the affordance quiet without depending on app CSS.
                   jsx(Codicon, {
                     name: 'arrow-right',
                     size: '0.85em',
-                    className: cn(
-                      'mt-0.5 shrink-0 opacity-40 transition-all duration-150',
-                      'text-(--ui-accent)',
-                      'group-hover:translate-x-0.5 group-hover:opacity-100',
-                      'motion-reduce:transition-none'
-                    )
+                    style: { color: 'var(--ui-accent, #7186ef)', opacity: .6, flexShrink: 0 }
                   }),
                   jsx('span', {
-                    className: cn(
-                      'shrink-0 text-xs text-(--ui-text-quaternary) opacity-0 transition-opacity',
-                      'group-hover:opacity-100 motion-reduce:transition-none'
-                    ),
+                    style: { flexShrink: 0, fontSize: 11, color: 'var(--ui-text-quaternary, #888)' },
                     'aria-hidden': true,
                     children: t('insertAction')
                   })
@@ -443,7 +326,7 @@ function FollowUpPanel({ attrs, streaming }) {
       // Always mounted so assistive tech has a region to observe; keyed by a
       // nonce so repeating the same action re-announces it.
       jsx('div', {
-        className: 'px-2 text-[0.6875rem] text-(--ui-text-quaternary)',
+        style: { paddingInline: 8, fontSize: 11, color: 'var(--ui-text-quaternary, #888)' },
         role: 'status',
         'aria-live': 'polite',
         children: status
@@ -467,7 +350,7 @@ export default {
         title: 'Follow-up',
         rowTip: 'Click to insert · Ctrl/Cmd+click to send · Alt+N',
         rowTipTruncated: 'Shortened to fit · click to insert the full prompt for review',
-        actionDescription: 'Click to insert. Ctrl or Command plus click sends immediately. Shortened prompts are always inserted in full for review.',
+        actionDescription: 'Click to insert. Ctrl/Cmd-click dispatches to this composer, not a delivery confirmation. Alt+1–5 inserts; Ctrl/Cmd+Alt+1–5 dispatches. Shortened prompts always insert in full for review.',
         truncatedDescription: 'This prompt is shortened in the preview and will be inserted in full for review.',
         insertAction: 'Insert',
         truncated: 'shortened',
@@ -475,7 +358,8 @@ export default {
         insertAll: 'Insert all',
         insertAllTip: 'Append every prompt to the composer',
         inserted: 'Inserted into the composer.',
-        sent: 'Sent.',
+        sent: 'Sent to composer; delivery is not confirmed.',
+        upgradeRequired: 'Upgrade Hermes Desktop to use session-scoped follow-ups.',
         noComposer: 'No visible composer in this chat.',
         emptyDirective: 'Follow-ups skipped: no prompts given',
         emptyDirectiveTip: 'The follow-up directive carried no usable prompt (expected p1="…").'
@@ -492,7 +376,8 @@ export default {
         insertAll: 'Chèn tất cả',
         insertAllTip: 'Thêm mọi gợi ý vào khung soạn',
         inserted: 'Đã chèn vào khung soạn.',
-        sent: 'Đã gửi.',
+        sent: 'Đã chuyển đến khung soạn; chưa xác nhận chuyển tin.',
+        upgradeRequired: 'Hãy nâng cấp Hermes Desktop để dùng gợi ý theo phiên.',
         noComposer: 'Không thấy khung soạn đang hiển thị.',
         emptyDirective: 'Đã bỏ qua gợi ý: không có nội dung',
         emptyDirectiveTip: 'Directive gợi ý không kèm nội dung dùng được (cần p1="…").'
@@ -504,7 +389,11 @@ export default {
       area: 'transcript.directives',
       data: {
         name: 'followup',
-        render: ({ attrs, streaming }) => jsx(FollowUpPanel, { attrs, streaming })
+        // A session switch remounts local state and invalidates pending completions.
+        // null (fresh draft) and undefined (unsupported host) stay distinct.
+        render: ({ attrs, sessionId, streaming }) => jsx(
+          FollowUpPanel, { attrs, sessionId, streaming }, `${typeof sessionId}:${sessionId}`
+        )
       }
     })
   }

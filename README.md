@@ -1,112 +1,129 @@
 # Follow-up
 
-Codex-style click-to-run follow-up prompts for Hermes Desktop — a port of
-Codex++'s `codex-follow-up.js`, rebuilt on Hermes' own extension seams.
+Session-scoped, clickable next-step prompts for **Hermes Desktop**. Follow-up
+renders prompts authored in the current assistant reply; it makes **no additional
+model calls**, reads no other sessions, requires no API keys, and does not update
+itself.
 
-The model ends a reply with one paragraph:
-
+```text
+::followup{p1="Run the tests for this change" p2="Explain this implementation"}
 ```
-::followup{p1="Run the tests" p2="Open a PR" p3="Explain the tradeoff"}
-```
 
-which renders as a small panel of clickable rows.
+## Compatibility
 
-The prompts follow the **user's current language** — English in an English
-conversation, Vietnamese with full diacritics in a Vietnamese one, native
-script in other languages. The language/quality contract lives in
-`$HERMES_HOME/SOUL.md`; the renderer preserves non-ASCII text byte-for-byte.
-It also normalizes only for deduplication and will not split an emoji or a
-combining diacritic when applying the 400-character cap.
+Requires Hermes **0.22.5 or later**, including a Desktop build exposing both
+`host.composer` and the owning `sessionId` in `transcript.directives` render
+props. These props landed in Hermes commit
+`c78ca093aa4b6759c055c3ed2bfbe7f741cf0292` (2026-10-23). Older 0.22.5 canaries
+can predate that contract: missing SDK methods or session identity **disable
+all actions**, with an explanatory compatibility notice. The version number is
+an installation floor, not proof of a compatible Desktop bundle.
 
-- **Click** a row → inserts the prompt into that chat's composer (edit, then send).
-- **Ctrl/Cmd+click** → sends immediately.
-- **Alt+1..5** → runs the Nth prompt without the mouse; add Ctrl/Cmd to send it
-  outright. Bound to the panel, not the window, so with several replies on
-  screen only the focused panel responds (Tab reaches it natively).
-- **Insert all** → appends every prompt as separate lines.
-
-A prompt longer than 400 characters is cut to fit and the row says so —
-otherwise a shortened prompt lands in the composer looking complete. The cut
-uses `Intl.Segmenter` grapheme boundaries, so it never splits an emoji ZWJ
-sequence, a regional-indicator flag, or a decomposed (NFD) diacritic; the
-regex fallback covers runtimes without `Intl.Segmenter`.
-
-Every action is announced through a polite `role="status"` live region, so
-screen-reader users hear the result. The status clears itself after 4s: it used
-to persist, which meant scrolling back to an old reply showed a stale "Sent."
+The plugin uses public Desktop SDK contributions and composer APIs only. It
+does not query, rewrite, or patch Hermes core markup and does not dispatch
+internal composer events.
 
 ## Install
 
-This repository is the **unified package** layout: the desktop half lives in
-`desktop/plugin.js`. Install it into any Hermes plugins root and Electron copies
-that half into `$HERMES_HOME/desktop-plugins/follow-up/` for you.
+Until a catalog submission is reviewed and merged, install from this public
+repository using Hermes' custom Git-source flow:
 
-```bash
-git clone https://github.com/anhtahaylove/hermes-plugin-follow-up   ~/.hermes/plugins/follow-up
+```sh
+hermes plugins install https://github.com/huuhungn/hermes-plugin-follow-up
+hermes plugins enable follow-up
 ```
 
-Then restart Desktop (or use **Settings -> Plugins -> Rescan**). It is enabled by
-default once installed; an explicit **Settings -> Plugins** toggle still wins.
-2. In the desktop app: ⌘K → **Reload desktop plugins**.
-3. Teach the model to emit the directive — see the "Follow-up suggestions"
-   section appended to `$HERMES_HOME/SOUL.md`.
+Then open **Desktop → Plugins**, locate Follow-up, and enable its **Desktop**
+half. A fresh CLI installation can leave the Desktop half disabled: the agent
+allow-list and Desktop's persisted enable decision are separate. Check the
+Desktop switch rather than assuming the CLI commands enabled the renderer.
 
-Turning the plugin off is safe: an unclaimed directive renders as plain text.
+The repository includes `plugin.yaml` and `desktop/plugin.js`. No npm packages
+are needed at runtime; Hermes supplies React and `@hermes/plugin-sdk`. The npm
+dependencies below are development-only.
 
-## Why it isn't a port of the Codex++ approach
+A catalog listing, if accepted, will pin a reviewed commit. Publishing a new
+commit here does not update that pin or any installed copy automatically.
 
-Codex++ had no extension API, so it scraped the DOM: hide the raw ```json
-block, MutationObserver the transcript, cull by viewport, LRU-cache parses in
-`localStorage`, and guess at the composer with a list of CSS selectors.
+## Interaction and safety
 
-Hermes exposes the transcript as a contribution area, so ~800 lines of
-scaffolding collapse to a registration:
+- **Click**: insert the full prompt into the owning chat's composer for review.
+- **Ctrl/Cmd-click**: request immediate submission through that chat's composer.
+  This is an explicit user action, not autonomous execution.
+- **Alt+1..5**: insert a row while this panel is focused; add Ctrl/Cmd to request
+  submission. Shortcuts are local to the panel, never window-wide.
+- **Insert all**: insert full prompts as separate lines.
+- Prompts over 400 characters have a grapheme-safe preview. Their **full text**
+  is retained; even a modified click inserts it for review instead of submitting
+  an abbreviated instruction.
+- Pending operations lock the panel. Session changes and unmounts invalidate
+  stale completions; a successful insert requires the SDK acknowledgement.
+- A submission result means only that the SDK dispatched to the composer,
+  **not** confirmed message delivery or model execution.
+- Hidden, absent, or disabled composers fail closed through the SDK. Explicit
+  fresh-draft identity routes to `new`, never the active chat as a fallback.
+- C0/C1 and bidi controls are rejected. Unicode, including Vietnamese accents,
+  emoji, ZWJ and ZWNJ, is preserved; equivalent prompts are deduplicated.
+- English and Vietnamese UI strings and accessible status announcements are
+  included. Streaming replies do not expose actionable partial prompts.
 
-| Codex++ | Here |
-| --- | --- |
-| MutationObserver + `scan()` + viewport culling | `transcript.directives` area |
-| Parse cache, panel cache, `localStorage` LRU | React renders from attrs |
-| `<style>` injection, hardcoded colors | app UI kit + theme variables |
-| Composer discovery by selector list | `[data-composer-target]` ancestor |
-| `document.execCommand` / value setters | `hermes:composer-insert` / `-submit` |
+**Disclosure:** Desktop plugins run with the application's authority, not in a
+sandbox. This plugin has no network, filesystem, credential, or storage access
+of its own. Ctrl/Cmd-click can submit model-authored text, so review suggestions
+before using it, particularly suggestions about external side effects.
 
-The one thing worth keeping was its **toggle** interaction (Ctrl+click), which
-survives here as click-to-insert vs Ctrl-click-to-send.
+## Prompt policy is separate from rendering
 
-## Routing
+Installing this Desktop-only plugin does **not** edit `SOUL.md`, inject a system
+prompt, or generate suggestions independently. The model must already know the
+`::followup` convention. If needed, review and add the following instruction to
+your own assistant instructions manually:
 
-Prompts are routed to the chat surface the panel is rendered **inside**, found
-by walking up to `[data-composer-target]` — which wraps both the transcript and
-its composer. With split tiles the prompt lands in the chat you clicked in.
+> When a concrete, safe next step remains for the current task, end with one
+> standalone paragraph of the form `::followup{p1="Run this change's tests"}`.
+> Offer one strong prompt, up to five only when genuinely distinct and needed.
+> Use the user's current language, full accents and native script. Each prompt
+> must be complete and sendable verbatim, within the current session's scope
+> and ownership. Do not suggest completed work, another session's work,
+> placeholders, or unapproved external side effects. Prefer review or dry-run
+> when execution is not authorized. Omit the directive for self-contained
+> answers. Avoid double quotes, Markdown syntax, URLs, email addresses, and
+> newlines inside prompt values so Markdown does not split the directive.
 
-Submit carries that surface's `data-composer-surface-id` and **fails closed**
-without it, matching core's own rule (`requestComposerSubmit` in
-`app/chat/composer/focus.ts`): with keep-alive tabs mounted but hidden, a
-broadcast without exact surface identity could be claimed by the wrong
-composer. Clicks inside a buried tab therefore do nothing.
+Language policy and whether a suggestion is useful are model-policy concerns;
+the renderer does not claim to verify them. Turning the plugin off leaves
+ordinary text rather than breaking the conversation.
 
-Inserts are deferred to a macrotask (core's focus-restoration contract);
-submits dispatch synchronously (deferring lets a tab reveal steal the target).
+## Development and verification
 
-## Tests
+Use a supported Node version from `package.json` (Node 22 or 24 recommended):
 
-```bash
-bash tests/run.sh
+```sh
+npm ci --ignore-scripts
+npm test
 ```
 
-Mounts the plugin with real React 19 + jsdom and asserts on the actual
-CustomEvents the composer bus subscribes to; then checks the SOUL.md syntax
-against core's own directive parser, plus a drift guard that fails if core's
-regexes change. The suite verifies `plugin.js` by hash before running, so it
-can never pass against a stale copy.
+The test loader maps `@hermes/plugin-sdk` to a test-only stub. No copy into
+`node_modules`, real model request, live composer, or user's instruction file
+is required. Tests exercise the real plugin component, SDK calls, async locks,
+fail-closed routing, Unicode, accessibility and status behavior. They do not
+prove model-policy compliance or live Hermes Desktop delivery.
 
-Validated by mutation: removing the surface-id guard, the streaming guard, the
-hidden-pane check, the ctrl-click branch, or the length cap each turns the
-suite red.
+Optional upstream parser integration requires `HERMES_SOURCE` pointing to an
+explicit Hermes source checkout. Without it, that test skips rather than
+validating a copied parser. The CSS test is a self-contained static source
+guard, not an upstream stylesheet or visual integration test. Before
+publication, run Hermes' own admission validator:
 
-## Limits
+```sh
+hermes plugins validate . --json
+```
 
-- Prompts cannot contain `"` — core's attribute regex ends the value there.
-  Keep them under ~120 chars; all five must fit core's 1024-char brace budget.
-- Max 5 prompts (`p1`..`p5`); each is truncated at 400 chars.
-- Desktop only. Other surfaces show the directive as plain text.
+CI runs component tests on Windows and Linux with Node 22 and 24. A real
+Desktop visual/split-pane smoke test remains a separate check; do not infer
+pixel fidelity or end-to-end delivery from jsdom.
+
+## License
+
+MIT. Originally inspired by Codex++ follow-up interactions, rebuilt on Hermes'
+public extension surfaces.
