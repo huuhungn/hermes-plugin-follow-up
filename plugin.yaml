@@ -1,8 +1,12 @@
 name: follow-up
-version: 0.1.0
+version: 1.0.0
 description: >-
-  Codex-style click-to-run follow-up prompts for Hermes Desktop. The model ends a
-  reply with a ::followup{...} paragraph; the plugin renders it as a compact
-  command list whose rows insert (or send) the prompt.
+  Click-to-insert, session-scoped follow-up prompts for Hermes Desktop.
+  Renders model-authored followup directives; Ctrl/Cmd-click requests submission.
 author: anhtahaylove
 license: MIT
+requires_hermes: ">=0.22.5"
+provides_tools: []
+provides_hooks: []
+provides_middleware: []
+requires_env: []
